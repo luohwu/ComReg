@@ -1,0 +1,19 @@
+# Normalize all text files to LF in the repository and on checkout.
+* text=auto eol=lf
+
+# Treat known binary assets as binary (never touch line endings).
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.eps  binary
+*.pdf  binary
+*.pt   binary
+*.pth  binary
+*.npy  binary
+*.npz  binary
+*.stl  binary
+*.ply  binary
+*.egg  binary
+*.whl  binary
+*.so   binary

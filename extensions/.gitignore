@@ -1,0 +1,12 @@
+data
+models_UltraBoneUDF/checkpoints
+.idea
+__pycache__
+**/__pycache__/
+**/__pycache__/
+results_head_values
+pcds_mm/**/**.ply
+**.xyz
+build/
+**/build/
+**/**/build/

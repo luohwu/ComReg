@@ -1,0 +1,91 @@
+{
+  "name": "ComReg (CUDA 12.8 — RTX 4090 / 5090)",
+
+  // Reuse the project Dockerfile (CUDA 12.8 + PyTorch cu128 -> Ada + Blackwell).
+  // context ".." so the Dockerfile's `COPY extensions` finds the repo's extensions/.
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+
+  // GPU passthrough. Requires the NVIDIA Container Toolkit on the host
+  // (Linux) or Docker Desktop + WSL2 GPU support (Windows).
+  // --shm-size raises /dev/shm so PyTorch DataLoader workers don't crash.
+  "runArgs": [
+    "--gpus", "all",
+    "--shm-size=16gb"
+  ],
+
+  // Lets VS Code warn early if no GPU is detected on the host.
+  "hostRequirements": {
+    "gpu": true
+  },
+
+  // Mount the repo at /workspace to match the Dockerfile WORKDIR. The compiled
+  // extensions live in site-packages, so the bind mount over /workspace is safe.
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+
+  // Bind-mount the host dataset into the container. The confs read
+  // ULTRABONES100K_ROOT (set below). Edit the source path to point at your
+  // host copy of UltraBones100k (e.g. /data/UltraBones100k, or F:/UltraBones100k
+  // on Windows + Docker Desktop, where the drive must be shared in settings).
+  "mounts": [
+    "source=/path/to/UltraBones100k,target=/mnt/UltraBones100k,type=bind",
+
+    // Training outputs (checkpoints/results). Scripts write to base_exp_dir
+    // "./../outs/..." relative to /workspace, i.e. /outs. Mount the host's
+    // sibling outs/ there so checkpoints land on the host and survive rebuilds.
+    "source=${localWorkspaceFolder}/../outs,target=/outs,type=bind"
+  ],
+
+  "containerEnv": {
+    "NVIDIA_VISIBLE_DEVICES": "all",
+    "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+    "PYTHONPATH": "/workspace",
+    "PYTHONNOUSERSITE": "1",
+    "ULTRABONES100K_ROOT": "/mnt/UltraBones100k",
+
+    // This container runs as root; Claude Code otherwise refuses
+    // bypassPermissions / --dangerously-skip-permissions under root. Marking the
+    // (disposable) container as a sandbox lifts that block so Claude Code can run
+    // permission-free here. Safe because the container is isolated and rebuildable.
+    "IS_SANDBOX": "1"
+  },
+
+  // Pass the host's Comet ML key through so the training scripts'
+  // Experiment(api_key=os.getenv("COMET_API_KEY")) works in-container. Kept in
+  // remoteEnv (not containerEnv) so the secret isn't baked into the image and so
+  // changes apply on reopen without a rebuild. Resolved from the env VS Code sees
+  // on the host — it must be a host user/system env var (or VS Code launched from
+  // a shell that has it).
+  "remoteEnv": {
+    "COMET_API_KEY": "${localEnv:COMET_API_KEY}"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/bin/python",
+        // Start the Claude Code extension in bypass-permissions mode (no per-edit
+        // prompts). The extension does not honor defaultMode from settings.json;
+        // BOTH keys below are required -- the mode plus the explicit skip-permissions
+        // allowance. Applies to NEW sessions started after the setting is present.
+        "claudeCode.initialPermissionMode": "bypassPermissions",
+        "claudeCode.allowDangerouslySkipPermissions": true
+      }
+    }
+  },
+
+  // On create: (1) install the user-level Claude Code settings so BOTH the CLI
+  // and the VS Code extension default to bypassPermissions (the extension only
+  // honors defaultMode from ~/.claude/settings.json, not project settings), then
+  // (2) a one-time sanity check printing the resolved Torch/CUDA build and GPU.
+  "postCreateCommand": "mkdir -p $HOME/.claude && cp .devcontainer/claude-settings.json $HOME/.claude/settings.json && python -c \"import torch; print('torch', torch.__version__, '| cuda', torch.version.cuda); print('arch_list', torch.cuda.get_arch_list()); print('cuda available:', torch.cuda.is_available()); print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')\""
+}

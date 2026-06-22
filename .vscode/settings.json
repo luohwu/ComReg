@@ -1,0 +1,10 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+
+    // Make the Claude Code extension start new sessions in bypass-permissions
+    // mode (no per-edit approval prompts). Both keys are required: the mode alone
+    // is not honored unless skip-permissions is also explicitly allowed.
+    "claudeCode.initialPermissionMode": "bypassPermissions",
+    "claudeCode.allowDangerouslySkipPermissions": true
+}

@@ -1,0 +1,53 @@
+# --- Datasets / experiment outputs (provide via ULTRABONES100K_ROOT; never commit) ---
+data/
+log/
+outs/
+*.xyz
+*.sif
+.cometml-runs/
+
+# --- Manuscript (kept out of the open-source release) ---
+/manuscript
+
+# --- Python build / packaging ---
+**/*.egg-info/
+build/
+**/build/
+dist/
+*.egg
+*.whl
+
+# --- Bytecode / caches ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+
+# --- Editors / IDE ---
+.idea/
+
+# --- Notebooks / OS ---
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# --- Compiled extensions ---
+*.so
+*.pyd
+*.dll
+*.dylib
