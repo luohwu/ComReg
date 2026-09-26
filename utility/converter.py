@@ -416,6 +416,17 @@ def compute_RTE_RRE_pcds(T_est, T_gt, translation_scale, src_pcd_moved, tgt_pcd)
     return rte*translation_scale, rre_degrees,dis,pcd_US_registered
 
 
+def project_to_so3(R: np.ndarray) -> np.ndarray:
+    """Nearest rotation matrix (SVD) for a (..., 3, 3) array."""
+    U, _, Vt = np.linalg.svd(R)
+    d = np.sign(np.linalg.det(U @ Vt))
+    D = np.zeros_like(R)
+    D[..., 0, 0] = 1.0
+    D[..., 1, 1] = 1.0
+    D[..., 2, 2] = d
+    return U @ D @ Vt
+
+
 def compute_mean_RTE_RRE_batch(T1: np.ndarray, T2: np.ndarray, translation_scale: float = 1.0):
     """
     Compute mean RTE and mean RRE over a batch of 4x4 transforms.
@@ -431,16 +442,18 @@ def compute_mean_RTE_RRE_batch(T1: np.ndarray, T2: np.ndarray, translation_scale
       rte_per_sample: (B,) array
       rre_deg_per_sample: (B,) array
     """
-    T1 = np.asarray(T1)
-    T2 = np.asarray(T2)
+    T1 = np.asarray(T1, dtype=np.float64)
+    T2 = np.asarray(T2, dtype=np.float64)
 
     if T1.shape != T2.shape or T1.ndim != 3 or T1.shape[1:] != (4, 4):
         raise ValueError(f"Expected T1 and T2 shape (B,4,4) and equal. Got {T1.shape} and {T2.shape}")
 
-    # Extract rotations and translations
-    R1 = T1[:, :3, :3]                         # (B,3,3)
+    # Extract rotations and translations. Rotations are projected onto SO(3) first: a slightly
+    # non-orthonormal estimate (e.g. from reduced-precision matmuls) otherwise pushes
+    # (trace - 1) / 2 past 1, and the clip below would report an error of exactly 0 deg.
+    R1 = project_to_so3(T1[:, :3, :3])         # (B,3,3)
     t1 = T1[:, :3, 3] * translation_scale      # (B,3)
-    R2 = T2[:, :3, :3]                         # (B,3,3)
+    R2 = project_to_so3(T2[:, :3, :3])         # (B,3,3)
     t2 = T2[:, :3, 3] * translation_scale      # (B,3)
 
     # --- RTE: L2 distance between translations ---

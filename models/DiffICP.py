@@ -22,11 +22,31 @@ The module has NO learnable parameters; it is a differentiable geometric refiner
 so gradients flow back through ``T_init`` (into the coarse pose head) and, if the
 input points carry grad, into whatever produced them. In training we typically
 pass detached point clouds so only the pose path is coupled.
+
+Numerics: the forward pass always runs in true FP32, even when TF32 is enabled
+globally (train.seed_everything does so for speed). Under TF32 the squared distances
+fed to the soft correspondences carry errors larger than 2*sigma^2 (~5e-5 for
+sigma = 0.005), and the Procrustes rotations drift off SO(3) (|det R - 1| up to ~1e-2
+after 25 iterations), which in turn made the RRE metric report 0 deg for ~20 % of
+samples. FP32 matches FP64 to ~0.003 deg here and costs no measurable time.
 """
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+
+
+@contextmanager
+def full_fp32():
+    """Disable TF32 for CUDA matmuls/convolutions inside the block (restored on exit)."""
+    m, c = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = m, c
 
 
 def apply_transform(T: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
@@ -94,6 +114,11 @@ class DiffICP(nn.Module):
         return float(self.sigma_init * (self.sigma / self.sigma_init) ** r)
 
     def _iter(self, T, src, tgt, sigma):
+        # FP32 guard per iteration so it also covers the checkpoint recomputation in backward.
+        with full_fp32():
+            return self._iter_fp32(T, src, tgt, sigma)
+
+    def _iter_fp32(self, T, src, tgt, sigma):
         src_t = apply_transform(T, src)
         d2 = torch.cdist(src_t, tgt) ** 2                 # (B, ns, nt)
         if self.hard:
