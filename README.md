@@ -1,4 +1,4 @@
-# ComReg — Shape-Aware CT–Ultrasound Bone Surface Registration via Instance-Level Shape Completion
+# ComReg — Shape-Aware Registration Without Pretraining: CT–Ultrasound Bone Surface Alignment via Instance-Level Shape Completion
 
 > Official implementation of
 > **“Shape-Aware Registration Without Pretraining: CT–Ultrasound Bone Surface Alignment via Instance-Level Shape Completion.”**
@@ -203,26 +203,30 @@ Adjust `max_epoch` in the conf to train longer or shorter.
 
 `test.py` loads a checkpoint, runs the model on the real US validation clouds, **saves** the
 completion and registration outputs, and **prints** the aggregate metrics
-(CD / HD95 / RTE / RRE, plus the DiffICP-refined RTE_ICP / RRE_ICP).
+(CD / HD95 / RTE / RRE, the DiffICP-refined RTE_ICP / RRE_ICP, and CD_REG / HD95_REG).
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--target_specimen_id` | `5` | Specimen to evaluate; `<= 0` runs all `1`–`14` |
-| `--target_anatomy` | `tibia` | `tibia`, `fibula`, or unset for both |
-| `--epoch` | `300` | Checkpoint epoch to load (`ckpt-<epoch>.pth`); use one that exists (e.g. `300`) |
+| `--target_specimen_id` | `2` | Specimen to evaluate; `<= 0` runs all `1`–`14` |
+| `--target_anatomy` | `fibula` | `tibia`, `fibula`, or unset for both |
+| `--epoch` | `150` | Checkpoint epoch to load (`ckpt-<epoch>.pth`); use one that exists |
 | `--ckpt` | unset | Explicit checkpoint path (overrides `--epoch` lookup) |
 | `--n_runs` | `30` | Number of evaluation batches (random disturbances) |
 | `--batch_size` | `4` | Clouds per batch |
 | `--save_pcd_runs` | `10` | Save point clouds for the first N runs (`0` = metrics only) |
-| `--icp_iters` | `25` | DiffICP iterations at test time (overrides the conf's `n_iters`) |
+| `--passes` | `3` | Network passes with test-time re-orientation (`1` = single pass) |
+| `--icp_iters` | `300` | DiffICP iterations at test time (overrides the conf's `n_iters`) |
 | `--icp_n_points` | `4096` | DiffICP correspondence subsample; `0` = full resolution (no subsample) |
-| `--icp_src` | `completed` | Geometry fed to ICP: `completed` shape or raw `partial` input |
+| `--icp_src` | `partial` | Geometry fed to ICP: the raw `partial` US input (as in the paper) or the `completed` shape |
+| `--icp_sigma` | `0.001` | Soft-correspondence width at test time, in normalised units (training uses `0.005`) |
+| `--icp_trim` | `0.1` | Trimmed-correspondence ratio at test time (training uses `0.2`) |
 
-At inference `test.py` runs **25 ICP iterations** (cheap with no gradient graph) at a
-**4096-point** correspondence resolution. A resolution sweep on `5_tibia/ckpt-300` showed
-accuracy is flat-to-*worse* above ~2–4k points while cost is `O(n²)` — full resolution (32768)
-was **~86× slower than 2048 for no accuracy gain** (the US cloud is partial, so denser sampling
-only adds spurious partial→full correspondences). Pass `--icp_n_points 0` for full resolution.
+At test time, DiffICP aligns the US cloud with more selective soft correspondences
+(σ = 0.001) and **300 iterations**, which are cheap without a gradient graph. Point-to-point ICP
+only slowly slides a partial sweep along the shaft, so translation keeps improving with
+iterations. Denser correspondence subsampling (more than 4096 points) did not help. Pass
+`--passes 1 --icp_src completed --icp_sigma 0.005 --icp_iters 25 --icp_trim 0.2` for the
+training-time settings.
 
 
 
@@ -242,9 +246,20 @@ sample_XXXX_completed.ply            completion output, in its OWN (input) frame
 sample_XXXX_completed_registered.ply completion aligned to the CT frame by the ESTIMATED pose
 sample_XXXX_registered.ply           input US aligned to the CT frame by the ESTIMATED pose
 transforms.npz                       T_gt / T_coarse / T_icp for every sample
-metrics.csv                          per-sample CD/HD95/RTE/RRE(+ICP)
+metrics.csv                          per-sample CD/HD95/RTE/RRE(+ICP)/CD_REG/HD95_REG
 metrics_summary.txt                  mean ± std over all samples
 ```
+
+Metrics (millimetres / degrees):
+
+- `RTE`/`RRE`: coarse pose of network pass 1.
+- `RTE_ICP`/`RRE_ICP`: final pose after DiffICP.
+- `CD_REG`/`HD95_REG`: one-sided distance from the US registered by the final pose to the CT
+  cloud.
+- `CD`/`HD95`: completion (last pass), placed with the GT pose.
+
+RRE is measured after projecting both rotations onto SO(3). A slightly non-orthonormal estimate
+otherwise pushes `(trace - 1) / 2` past 1, and the clip reports exactly 0°.
 
 ---
 
@@ -274,17 +289,24 @@ All knobs live in [`confs/default.conf`](confs/default.conf)
 If you use this code, please cite:
 
 ```bibtex
-@inproceedings{wu2026comreg,
-  title     = {Shape-Aware Registration Without Pretraining: CT--Ultrasound Bone Surface
-               Alignment via Instance-Level Shape Completion},
-  author    = {Wu, Luohong and Cho, Elise and Ao, Yunke and Marx, Lennard and
-               Cavalcanti, Nicola and Yang, Yiru and Seibold, Matthias and F\"urnstahl, Philipp},
-  booktitle = {Medical Image Computing and Computer Assisted Intervention (MICCAI)},
-  year      = {2026}
+@InProceedings{10.1007/978-3-032-38186-6_29,
+author="Wu, Luohong,
+Cho, Elise,
+Ao, Yunke,
+Marx, Lennard,
+Cavalcanti, Nicola A.,
+Yang, Yiru,
+Seibold, Matthias,
+F{\"u}rnstahl, Philipp",
+title="Shape-Aware Registration Without Pretraining: CT-Ultrasound Bone Surface Alignment via Instance-Level Shape Completion",
+booktitle="Medical Image Computing and Computer Assisted Intervention -- MICCAI 2026",
+year="2027",
+publisher="Springer Nature Switzerland",
+address="Cham",
+pages="301--311",
+isbn="978-3-032-38186-6"
 }
 ```
-
-*(Citation details will be finalized upon publication.)*
 
 Please also cite the dataset and the completion backbone you rely on:
 

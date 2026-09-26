@@ -9,6 +9,10 @@ It reuses Runner_DiffICP from train.py for model construction and checkpoint
 loading, then runs its own evaluation loop so it can dump per-sample point clouds
 and transforms (train.py's validate() only computes metrics).
 
+Test-time pipeline: coarse pose from the network, `--passes`-1 re-orientation passes
+(the network is re-run on the US cloud pre-rotated by the current estimate, see
+reoriented_coarse), then DiffICP with test-time settings (--icp_*).
+
 Saved per specimen/anatomy under
     <general.base_exp_dir>/<specimen>_<anatomy>/evaluation/ckpt-<epoch>/
   gt.ply                              ground-truth (CT) point cloud, GT frame
@@ -17,8 +21,11 @@ Saved per specimen/anatomy under
   sample_XXXX_completed_registered.ply completion aligned to the CT frame by the ESTIMATED pose
   sample_XXXX_registered.ply          input US aligned to the CT frame by the ESTIMATED pose
   transforms.npz                      T_gt / T_coarse / T_icp for every sample
-  metrics.csv                     per-sample CD/HD95/RTE/RRE(+ICP)
+  metrics.csv                     per-sample CD/HD95/RTE/RRE(+ICP)/CD_REG/HD95_REG
   metrics_summary.txt             mean ± std over all samples
+
+CD/HD95: completion vs CT (completed cloud placed with the GT pose). CD_REG/HD95_REG:
+one-sided distance from the US registered by the estimated pose to the CT cloud.
 
 Example:
     python test.py --target_specimen_id 2 --target_anatomy tibia --epoch 300
@@ -61,9 +68,35 @@ def _apply_T(T, xyz):
     return torch.matmul(T[:3, :3], xyz.transpose(0, 1)).transpose(0, 1) + T[:3, 3].unsqueeze(0)
 
 
+def _project_so3(R):
+    """Nearest rotation matrix (SVD), batched (B, 3, 3)."""
+    U, _, Vh = torch.linalg.svd(R.double())
+    d = torch.sign(torch.det(U @ Vh))
+    D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
+    return (U @ D @ Vh).to(R.dtype)
+
+
+def reoriented_coarse(runner, x, gt, feat_gt, T1, completed1, passes):
+    """Test-time re-orientation. The pose head is least accurate for large input rotations,
+    so the network is re-run on the input pre-rotated by the current estimate: pass k sees
+    x_k = x R_acc^T (still centred), predicts T_k, and the estimate for x is [R_k R_acc | t_k].
+    Returns (T (B,4,4), completed cloud of the last pass in x's frame (B,N,3))."""
+    T, comp = T1, completed1
+    B = x.shape[0]
+    for _ in range(passes - 1):
+        R_acc = _project_so3(T[:, :3, :3])
+        out, feat = runner.model_shapeCompletion(torch.matmul(x, R_acc.transpose(1, 2)).contiguous())
+        Tk = runner.model_PoseFromRebuildFeature(
+            feat, feat_gt.repeat((B, 1)), out[3].mean(dim=1) - gt.mean(dim=1))
+        T = Tk.clone()
+        T[:, :3, :3] = torch.matmul(Tk[:, :3, :3], R_acc)
+        comp = torch.matmul(out[3], R_acc)             # back to x's frame
+    return T, comp
+
+
 @torch.no_grad()
 def evaluate_and_save(runner, out_dir, n_runs=100, batch_size=4, save_pcd_runs=10,
-                      icp_src='completed'):
+                      icp_src='partial', passes=1):
     """Run the model on the real US validation clouds, save results + metrics.
 
     Mirrors Runner_ShapeCompletion.validate() (same normalization, random
@@ -71,9 +104,10 @@ def evaluate_and_save(runner, out_dir, n_runs=100, batch_size=4, save_pcd_runs=1
     and registration outputs to `out_dir` and returns a dict of metric arrays.
 
     icp_src selects what the DiffICP refinement aligns to the GT:
-      'completed' -> the completed cloud (outputs[3]); 'partial' -> the raw
-    partial US input. The coarse pose always comes from the completed-shape
+      'partial' -> the raw partial US input (as in the paper); 'completed' -> the
+    completed cloud. The coarse pose always comes from the completed-shape
     feature; only the ICP geometry differs.
+    passes: network passes with test-time re-orientation (see reoriented_coarse).
     """
     os.makedirs(out_dir, exist_ok=True)
     ds = runner.dataset
@@ -96,7 +130,7 @@ def evaluate_and_save(runner, out_dir, n_runs=100, batch_size=4, save_pcd_runs=1
     _, rebuild_feature_gt_untransformed = runner.model_shapeCompletion(gt)
 
     scale = ds.shape_scale.item()
-    metrics = {k: [] for k in ("CD", "HD95", "RTE", "RRE", "RTE_ICP", "RRE_ICP")}
+    metrics = {k: [] for k in ("CD", "HD95", "RTE", "RRE", "RTE_ICP", "RRE_ICP", "CD_REG", "HD95_REG")}
     rows = []
     T_gt_all, T_coarse_all, T_icp_all = [], [], []
     sample_idx = 0
@@ -138,13 +172,20 @@ def evaluate_and_save(runner, out_dir, n_runs=100, batch_size=4, save_pcd_runs=1
             rebuild_feature.detach(),
             rebuild_feature_gt_untransformed.repeat((B, 1)).detach(),
             mean_diff.detach())
-        # DiffICP refinement: align either the completed cloud or the raw partial
-        # US input to the GT. (Default 'completed' reproduces Runner._eval_pose.)
-        src_icp = outputs[3].detach() if icp_src == 'completed' else intra_data_transformed.detach()
+        # Test-time re-orientation: DiffICP starts from the last pass's estimate, and
+        # its completion (mapped back to the input frame) is the one reported/saved.
+        T_start, completed = T_coarse, outputs[3]
+        if passes > 1:
+            T_start, completed = reoriented_coarse(runner, intra_data_transformed, gt,
+                                                   rebuild_feature_gt_untransformed, T_coarse,
+                                                   outputs[3], passes)
+        # DiffICP refinement: align either the raw partial US input (as in the paper)
+        # or the completed cloud to the GT.
+        src_icp = completed.detach() if icp_src == 'completed' else intra_data_transformed.detach()
         tgt_icp = gt.detach()
         if tgt_icp.shape[0] == 1 and B > 1:
             tgt_icp = tgt_icp.repeat(B, 1, 1)
-        T_icp = runner.diff_icp(src_icp, tgt_icp, T_coarse)
+        T_icp = runner.diff_icp(src_icp, tgt_icp, T_start)
 
         rte, rre = compute_mean_RTE_RRE_batch(T_gt.cpu().numpy(), T_coarse.detach().cpu().numpy(), scale)
         metrics["RTE"].extend(np.atleast_1d(rte).tolist())
@@ -157,7 +198,7 @@ def evaluate_and_save(runner, out_dir, n_runs=100, batch_size=4, save_pcd_runs=1
 
         for b in range(outputs[3].shape[0]):
             # Completed cloud brought into the GT frame with the GT transform (for CD/HD95).
-            completed_gtframe = _apply_T(T_gt[b], outputs[3][b])
+            completed_gtframe = _apply_T(T_gt[b], completed[b])
             comp_o3d = o3d.geometry.PointCloud()
             comp_o3d.points = o3d.utility.Vector3dVector(completed_gtframe.cpu().numpy())
             d_gt2pred = np.asarray(gt_o3d.compute_point_cloud_distance(comp_o3d))
@@ -172,11 +213,20 @@ def evaluate_and_save(runner, out_dir, n_runs=100, batch_size=4, save_pcd_runs=1
             T_coarse_all.append(T_coarse[b].detach().cpu().numpy())
             T_icp_all.append(T_icp[b].detach().cpu().numpy() if has_icp else np.full((4, 4), np.nan))
 
+            # Registration distance: US registered by the estimated pose -> CT cloud, one-sided.
+            reg_o3d = o3d.geometry.PointCloud()
+            reg_o3d.points = o3d.utility.Vector3dVector(_apply_T(T_reg, intra_data_transformed[b]).cpu().numpy())
+            d_reg = np.asarray(reg_o3d.compute_point_cloud_distance(gt_o3d)) * scale
+            CD_REG, HD95_REG = float(d_reg.mean()), float(np.percentile(d_reg, 95))
+            metrics["CD_REG"].append(CD_REG)
+            metrics["HD95_REG"].append(HD95_REG)
+
             row = {"sample": sample_idx, "CD": float(CD), "HD95": float(HD95),
                    "RTE": float(np.atleast_1d(rte)[b]), "RRE": float(np.atleast_1d(rre)[b])}
             if has_icp:
                 row["RTE_ICP"] = float(np.atleast_1d(rte_icp)[b])
                 row["RRE_ICP"] = float(np.atleast_1d(rre_icp)[b])
+            row["CD_REG"], row["HD95_REG"] = CD_REG, HD95_REG
             rows.append(row)
 
             # Save a subset of point clouds. Three distinct artifacts:
@@ -189,9 +239,9 @@ def evaluate_and_save(runner, out_dir, n_runs=100, batch_size=4, save_pcd_runs=1
                 _save_pcd(os.path.join(out_dir, f"{tag}_input.ply"),
                           intra_data_transformed[b], color=(0, 0, 1))
                 _save_pcd(os.path.join(out_dir, f"{tag}_completed.ply"),
-                          outputs[3][b], color=(0, 1, 0))
+                          completed[b], color=(0, 1, 0))
                 _save_pcd(os.path.join(out_dir, f"{tag}_completed_registered.ply"),
-                          _apply_T(T_reg, outputs[3][b]), color=(0, 1, 0))
+                          _apply_T(T_reg, completed[b]), color=(0, 1, 0))
                 # Input aligned by the ESTIMATED pose -> should overlap the GT cloud.
                 _save_pcd(os.path.join(out_dir, f"{tag}_registered.ply"),
                           _apply_T(T_reg, intra_data_transformed[b]), color=(0, 1, 1))
@@ -237,19 +287,24 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--save_pcd_runs', type=int, default=10,
                         help='save point clouds for the first N runs (0 = none)')
+    parser.add_argument('--passes', type=int, default=3,
+                        help='network passes with test-time re-orientation (1 = single pass)')
     # ---- test-time DiffICP overrides -----------------------------------------
-    # More iterations at inference are cheap and help (no gradient graph to keep).
-    # Correspondence RESOLUTION (n_points), however, does NOT help: a sweep on
-    # 5_tibia/ckpt-300 showed accuracy is flat-to-worse above ~2-4k points while
-    # cost is O(n^2) (full res is ~86x slower than 2048 for no gain -- the US is
-    # partial, so denser sampling just adds spurious partial->full matches).
-    # Default to 4096 (best observed RTE_ICP/RRE_ICP); pass 0 for full resolution.
-    parser.add_argument('--icp_iters', type=int, default=25,
+    # The training-time settings (conf diff_icp block) are kept for training; at test time
+    # DiffICP aligns the US cloud itself (as in the paper) with more selective soft
+    # correspondences (sigma 0.001 vs 0.005 in training) and more iterations, which are cheap
+    # without a gradient graph: point-to-point ICP only slowly slides a partial sweep along
+    # the shaft. Denser correspondence subsampling (> 4096 points) did not help.
+    parser.add_argument('--icp_iters', type=int, default=300,
                         help='DiffICP iterations at test time (overrides conf)')
     parser.add_argument('--icp_n_points', type=int, default=4096,
                         help='DiffICP correspondence subsample; 0 = full resolution (no subsample)')
-    parser.add_argument('--icp_src', type=str, default='completed', choices=['completed', 'partial'],
-                        help="what DiffICP aligns to GT: 'completed' cloud or the raw 'partial' US input")
+    parser.add_argument('--icp_src', type=str, default='partial', choices=['completed', 'partial'],
+                        help="what DiffICP aligns to GT: the raw 'partial' US input or the 'completed' cloud")
+    parser.add_argument('--icp_sigma', type=float, default=0.001,
+                        help='DiffICP soft-correspondence width at test time (normalised units; overrides conf)')
+    parser.add_argument('--icp_trim', type=float, default=0.1,
+                        help='DiffICP trimmed-correspondence ratio at test time (overrides conf)')
     args = parser.parse_args()
 
     conf = read_confs(CONFIG_FILE)
@@ -279,20 +334,21 @@ def main():
             # Runner_DiffICP loads the checkpoint in __init__ (via ckp_file_path).
             runner = Runner_DiffICP(conf, experiment=None)
 
-            # Test-time accuracy overrides: run DiffICP at full resolution and
-            # with more iterations (no gradient graph to bound at inference).
+            # Test-time DiffICP settings (no gradient graph to bound at inference).
             runner.diff_icp.n_iters = args.icp_iters
             runner.diff_icp.n_points = None if args.icp_n_points <= 0 else args.icp_n_points
-            print(f"[test] DiffICP: n_iters={runner.diff_icp.n_iters}, "
+            runner.diff_icp.sigma = runner.diff_icp.sigma_init = args.icp_sigma   # constant sigma
+            runner.diff_icp.trim_ratio = args.icp_trim
+            print(f"[test] passes={args.passes}, DiffICP: n_iters={runner.diff_icp.n_iters}, "
                   f"n_points={'full' if runner.diff_icp.n_points is None else runner.diff_icp.n_points}, "
-                  f"icp_src={args.icp_src}")
+                  f"sigma={runner.diff_icp.sigma}, trim={runner.diff_icp.trim_ratio}, icp_src={args.icp_src}")
 
             out_dir = os.path.join(conf['general.base_exp_dir'], f"{specimen_id}_{anatomy}",
                                    "evaluation", f"ckpt-{args.epoch}")
             summary, summary_txt = evaluate_and_save(
                 runner, out_dir, n_runs=args.n_runs,
                 batch_size=args.batch_size, save_pcd_runs=args.save_pcd_runs,
-                icp_src=args.icp_src)
+                icp_src=args.icp_src, passes=args.passes)
 
             print(f"\n[test] {specimen_id}_{anatomy}  ->  {out_dir}")
             print(summary_txt)
