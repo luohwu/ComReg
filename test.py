@@ -42,7 +42,7 @@ import torch
 import open3d as o3d
 from tqdm import tqdm
 
-from train import Runner_DiffICP, seed_everything, device, CONFIG_FILE
+from train import Runner_DiffICP, seed_everything, device, CONFIG_FILE, TEST_TIME, reoriented_coarse
 from utility import misc
 from utility.read_confs import read_confs
 from utility.converter import (
@@ -66,32 +66,6 @@ def _save_pcd(path, xyz, color=None):
 def _apply_T(T, xyz):
     """Apply a 4x4 transform to an (N, 3) tensor."""
     return torch.matmul(T[:3, :3], xyz.transpose(0, 1)).transpose(0, 1) + T[:3, 3].unsqueeze(0)
-
-
-def _project_so3(R):
-    """Nearest rotation matrix (SVD), batched (B, 3, 3)."""
-    U, _, Vh = torch.linalg.svd(R.double())
-    d = torch.sign(torch.det(U @ Vh))
-    D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
-    return (U @ D @ Vh).to(R.dtype)
-
-
-def reoriented_coarse(runner, x, gt, feat_gt, T1, completed1, passes):
-    """Test-time re-orientation. The pose head is least accurate for large input rotations,
-    so the network is re-run on the input pre-rotated by the current estimate: pass k sees
-    x_k = x R_acc^T (still centred), predicts T_k, and the estimate for x is [R_k R_acc | t_k].
-    Returns (T (B,4,4), completed cloud of the last pass in x's frame (B,N,3))."""
-    T, comp = T1, completed1
-    B = x.shape[0]
-    for _ in range(passes - 1):
-        R_acc = _project_so3(T[:, :3, :3])
-        out, feat = runner.model_shapeCompletion(torch.matmul(x, R_acc.transpose(1, 2)).contiguous())
-        Tk = runner.model_PoseFromRebuildFeature(
-            feat, feat_gt.repeat((B, 1)), out[3].mean(dim=1) - gt.mean(dim=1))
-        T = Tk.clone()
-        T[:, :3, :3] = torch.matmul(Tk[:, :3, :3], R_acc)
-        comp = torch.matmul(out[3], R_acc)             # back to x's frame
-    return T, comp
 
 
 @torch.no_grad()
@@ -287,7 +261,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--save_pcd_runs', type=int, default=10,
                         help='save point clouds for the first N runs (0 = none)')
-    parser.add_argument('--passes', type=int, default=3,
+    parser.add_argument('--passes', type=int, default=TEST_TIME['passes'],
                         help='network passes with test-time re-orientation (1 = single pass)')
     # ---- test-time DiffICP overrides -----------------------------------------
     # The training-time settings (conf diff_icp block) are kept for training; at test time
@@ -295,15 +269,15 @@ def main():
     # correspondences (sigma 0.001 vs 0.005 in training) and more iterations, which are cheap
     # without a gradient graph: point-to-point ICP only slowly slides a partial sweep along
     # the shaft. Denser correspondence subsampling (> 4096 points) did not help.
-    parser.add_argument('--icp_iters', type=int, default=300,
+    parser.add_argument('--icp_iters', type=int, default=TEST_TIME['n_iters'],
                         help='DiffICP iterations at test time (overrides conf)')
-    parser.add_argument('--icp_n_points', type=int, default=4096,
+    parser.add_argument('--icp_n_points', type=int, default=TEST_TIME['n_points'],
                         help='DiffICP correspondence subsample; 0 = full resolution (no subsample)')
-    parser.add_argument('--icp_src', type=str, default='partial', choices=['completed', 'partial'],
+    parser.add_argument('--icp_src', type=str, default=TEST_TIME['icp_src'], choices=['completed', 'partial'],
                         help="what DiffICP aligns to GT: the raw 'partial' US input or the 'completed' cloud")
-    parser.add_argument('--icp_sigma', type=float, default=0.001,
+    parser.add_argument('--icp_sigma', type=float, default=TEST_TIME['sigma'],
                         help='DiffICP soft-correspondence width at test time (normalised units; overrides conf)')
-    parser.add_argument('--icp_trim', type=float, default=0.1,
+    parser.add_argument('--icp_trim', type=float, default=TEST_TIME['trim_ratio'],
                         help='DiffICP trimmed-correspondence ratio at test time (overrides conf)')
     args = parser.parse_args()
 
@@ -335,10 +309,7 @@ def main():
             runner = Runner_DiffICP(conf, experiment=None)
 
             # Test-time DiffICP settings (no gradient graph to bound at inference).
-            runner.diff_icp.n_iters = args.icp_iters
-            runner.diff_icp.n_points = None if args.icp_n_points <= 0 else args.icp_n_points
-            runner.diff_icp.sigma = runner.diff_icp.sigma_init = args.icp_sigma   # constant sigma
-            runner.diff_icp.trim_ratio = args.icp_trim
+            runner.set_icp(args.icp_iters, args.icp_n_points, args.icp_sigma, args.icp_trim)
             print(f"[test] passes={args.passes}, DiffICP: n_iters={runner.diff_icp.n_iters}, "
                   f"n_points={'full' if runner.diff_icp.n_points is None else runner.diff_icp.n_points}, "
                   f"sigma={runner.diff_icp.sigma}, trim={runner.diff_icp.trim_ratio}, icp_src={args.icp_src}")
