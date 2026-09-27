@@ -35,6 +35,7 @@ from extensions.chamfer_dist import ChamferDistanceL1,ChamferDistanceL1_one_side
 from utility.converter import *
 
 import random
+import contextlib
 def seed_everything(seed: int = 42, deterministic: bool = True) -> None:
     """
     Seed Python, NumPy, and PyTorch (CPU & CUDA) for reproducibility.
@@ -76,6 +77,23 @@ def seed_everything(seed: int = 42, deterministic: bool = True) -> None:
         # extra memory, with negligible precision loss for this regression task.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+
+@contextlib.contextmanager
+def fixed_seed(seed):
+    """Seed NumPy and PyTorch inside the block (or decorated function), then restore the
+    previous RNG states, so the caller's random stream is left untouched."""
+    np_state, torch_state = np.random.get_state(), torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
 
 
 def worker_init_fn(worker_id):
@@ -485,7 +503,7 @@ class Runner_ShapeCompletion:
                     _metrics['RRE_ICP'] = RRE_ICP_average_meter.avg()
                 self.experiment.log_metrics(_metrics, epoch=epoch)
 
-            if epoch % 5 == 0 and self.experiment:
+            if epoch % 10 == 0 and self.experiment:
                 metrics = self.validate()
                 self.experiment.log_metrics({'Validation CD': metrics}, epoch=epoch)
 
@@ -498,6 +516,7 @@ class Runner_ShapeCompletion:
                 self.save_checkpoint(metrics, best_metrics, prefix=f'ckpt-{epoch}')
 
 
+    @fixed_seed(1234)   # same disturbances at every validation, comparable across epochs
     def validate(self):
         self.model_PoseFromRebuildFeature.eval()
         #self.model_shapeCompletion.eval()
@@ -527,7 +546,7 @@ class Runner_ShapeCompletion:
 
 
 
-        for run_idx in range(100):
+        for run_idx in range(20):
             idx = np.random.permutation(intra_data_raw.shape[0])[:4]
             B = len(idx)
 
@@ -794,6 +813,37 @@ from models.DiffICP import DiffICP
 
 CONFIG_FILE = 'confs/default.conf'
 
+# Test-time pipeline, shared by test.py (flag defaults) and validation: `passes` network
+# passes with re-orientation, then DiffICP on the partial US cloud with these settings.
+# Training keeps the conf's diff_icp block.
+TEST_TIME = dict(passes=3, icp_src='partial', n_iters=300, n_points=4096, sigma=0.001, trim_ratio=0.1)
+
+
+def _project_so3(R):
+    """Nearest rotation matrix (SVD), batched (B, 3, 3)."""
+    U, _, Vh = torch.linalg.svd(R.double())
+    d = torch.sign(torch.det(U @ Vh))
+    D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
+    return (U @ D @ Vh).to(R.dtype)
+
+
+def reoriented_coarse(runner, x, gt, feat_gt, T1, completed1, passes):
+    """Test-time re-orientation. The pose head is least accurate for large input rotations,
+    so the network is re-run on the input pre-rotated by the current estimate: pass k sees
+    x_k = x R_acc^T (still centred), predicts T_k, and the estimate for x is [R_k R_acc | t_k].
+    Returns (T (B,4,4), completed cloud of the last pass in x's frame (B,N,3))."""
+    T, comp = T1, completed1
+    B = x.shape[0]
+    for _ in range(passes - 1):
+        R_acc = _project_so3(T[:, :3, :3])
+        out, feat = runner.model_shapeCompletion(torch.matmul(x, R_acc.transpose(1, 2)).contiguous())
+        Tk = runner.model_PoseFromRebuildFeature(
+            feat, feat_gt.repeat((B, 1)), out[3].mean(dim=1) - gt.mean(dim=1))
+        T = Tk.clone()
+        T[:, :3, :3] = torch.matmul(Tk[:, :3, :3], R_acc)
+        comp = torch.matmul(out[3], R_acc)             # back to x's frame
+    return T, comp
+
 
 class Runner_DiffICP(Runner_ShapeCompletion):
     def __init__(self, conf, experiment=None):
@@ -861,22 +911,36 @@ class Runner_DiffICP(Runner_ShapeCompletion):
         self._reg_T_icp = T_fine.detach()
         return loss_registration, T_detached.detach()
 
-    # ---- validation: coarse MLP -> DiffICP refine (under no_grad) -------------
+    def set_icp(self, n_iters, n_points, sigma, trim_ratio):
+        """Set the DiffICP settings (n_points <= 0 or None = full resolution; constant sigma)."""
+        icp = self.diff_icp
+        icp.n_iters, icp.trim_ratio = n_iters, trim_ratio
+        icp.n_points = None if not n_points or n_points <= 0 else n_points
+        icp.sigma = icp.sigma_init = sigma
+
+    # ---- validation: the test-time pipeline (TEST_TIME), under no_grad --------
     def _eval_pose(self, rebuild_feature, rebuild_feature_gt_untransformed, mean_diff, outputs, gt, B, partial=None):
         T_coarse = self.model_PoseFromRebuildFeature(
             rebuild_feature.detach(),
             rebuild_feature_gt_untransformed.repeat((B, 1)).detach(),
             mean_diff.detach())
-        # ICP source: completed cloud (default) or the raw partial input (icp_src).
-        if self.icp_src == 'partial' and partial is not None:
-            src = partial.detach()
-        else:
-            src = outputs[3].detach()
+        T_start, completed = T_coarse, outputs[3]
+        if TEST_TIME['passes'] > 1:
+            T_start, completed = reoriented_coarse(self, partial, gt, rebuild_feature_gt_untransformed,
+                                                   T_coarse, outputs[3], TEST_TIME['passes'])
+        src = partial.detach() if TEST_TIME['icp_src'] == 'partial' else completed.detach()
         tgt = gt.detach()
         if tgt.shape[0] == 1 and B > 1:
             tgt = tgt.repeat(B, 1, 1)
-        # Primary (RTE/RRE) = coarse; refined (RTE_ICP/RRE_ICP) stashed for logging.
-        self._eval_T_icp = self.diff_icp(src, tgt, T_coarse)
+        # Test-time DiffICP settings for validation only; the training settings are restored.
+        icp = self.diff_icp
+        train_icp = (icp.n_iters, icp.n_points, icp.sigma, icp.sigma_init, icp.trim_ratio)
+        self.set_icp(TEST_TIME['n_iters'], TEST_TIME['n_points'], TEST_TIME['sigma'], TEST_TIME['trim_ratio'])
+        try:
+            # Primary (RTE/RRE) = pass-1 coarse; refined (RTE_ICP/RRE_ICP) stashed for logging.
+            self._eval_T_icp = self.diff_icp(src, tgt, T_start)
+        finally:
+            icp.n_iters, icp.n_points, icp.sigma, icp.sigma_init, icp.trim_ratio = train_icp
         return T_coarse
 
 
